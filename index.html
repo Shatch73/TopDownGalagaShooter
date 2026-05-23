@@ -81,7 +81,8 @@
     <h1>GALAGA</h1>
     <p class="blink">PRESS SPACE TO START</p>
     <div class="controls">
-      <kbd>←</kbd> <kbd>→</kbd> Move &nbsp;|&nbsp; <kbd>SPACE</kbd> Fire
+      <kbd>←</kbd> <kbd>→</kbd> Move &nbsp;|&nbsp; <kbd>SPACE</kbd> Fire<br>
+      📱 Touch: drag to move + auto-fire
     </div>
   </div>
 </div>
@@ -251,7 +252,64 @@ function queueDiveBombers() {
   }
 }
 
-// ─── Input ───────────────────────────────────────────────────
+// ─── Touch Input ─────────────────────────────────────────────
+const TOUCH = { active: false, x: 0, y: 0, touchId: null };
+
+function getTouchPos(touch) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = W / rect.width;
+  return {
+    x: (touch.clientX - rect.left) * scaleX,
+    y: (touch.clientY - rect.top) * scaleX
+  };
+}
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (gameState === 'title') { startGame(); return; }
+  if (gameState === 'gameover') { resetGame(); return; }
+  for (const touch of e.changedTouches) {
+    if (TOUCH.touchId === null) {
+      const pos = getTouchPos(touch);
+      TOUCH.active = true;
+      TOUCH.x = pos.x;
+      TOUCH.y = pos.y;
+      TOUCH.touchId = touch.identifier;
+      KEY.SPACE = true;
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const touch of e.changedTouches) {
+    if (touch.identifier === TOUCH.touchId) {
+      const pos = getTouchPos(touch);
+      TOUCH.x = pos.x;
+      TOUCH.y = pos.y;
+      player.x = Math.max(20, Math.min(W - 20, TOUCH.x));
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const touch of e.changedTouches) {
+    if (touch.identifier === TOUCH.touchId) {
+      TOUCH.active = false;
+      TOUCH.touchId = null;
+      KEY.SPACE = false;
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchcancel', e => {
+  TOUCH.active = false;
+  TOUCH.touchId = null;
+  KEY.SPACE = false;
+});
+
+// ─── Keyboard Input ──────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft')  KEY.LEFT = true;
   if (e.key === 'ArrowRight') KEY.RIGHT = true;
@@ -270,6 +328,12 @@ overlay.addEventListener('click', () => {
   if (gameState === 'title') startGame();
   if (gameState === 'gameover') resetGame();
 });
+
+overlay.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (gameState === 'title') startGame();
+  if (gameState === 'gameover') resetGame();
+}, { passive: false });
 
 // ─── Game Flow ───────────────────────────────────────────────
 function startGame() {
