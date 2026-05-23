@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Galaga Shooter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+  }
+  #gameContainer {
+    position: relative;
+    border: 2px solid #333;
+  }
+  canvas {
+    display: block;
+    background: #0a0a1a;
+  }
+  #ui {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 16px;
+    color: #fff;
+    font-size: 14px;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #ui span { text-shadow: 0 0 4px rgba(255,255,255,0.5); }
+  .label { color: #888; }
+  #overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background: rgba(0,0,0,0.75);
+    color: #fff;
+    z-index: 20;
+    cursor: pointer;
+  }
+  #overlay h1 { font-size: 48px; letter-spacing: 8px; color: #ff0; }
+  #overlay h2 { font-size: 24px; color: #f44; margin-top: 10px; }
+  #overlay p { font-size: 16px; margin-top: 20px; color: #aaa; }
+  #overlay .blink { animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #overlay .controls {
+    margin-top: 24px;
+    font-size: 13px;
+    color: #666;
+    text-align: center;
+    line-height: 1.8;
+  }
+  #overlay .controls kbd {
+    color: #ccc;
+    background: #222;
+    padding: 2px 8px;
+    border: 1px solid #555;
+    border-radius: 3px;
+  }
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="game" width="480" height="640"></canvas>
+  <div id="ui">
+    <span><span class="label">SCORE</span> <span id="scoreDisplay">0</span></span>
+    <span><span class="label">LIVES</span> <span id="livesDisplay">3</span></span>
+    <span><span class="label">STAGE</span> <span id="stageDisplay">1</span></span>
+  </div>
+  <div id="overlay">
+    <h1>GALAGA</h1>
+    <p class="blink">PRESS SPACE TO START</p>
+    <div class="controls">
+      <kbd>←</kbd> <kbd>→</kbd> Move &nbsp;|&nbsp; <kbd>SPACE</kbd> Fire
+    </div>
+  </div>
+</div>
+<script>
+// ============================================================
+// 🔫 TOP-DOWN GALAGA SHOOTER  —  Full Arcade Clone
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 480, H = 640;
+const scoreSpan = document.getElementById('scoreDisplay');
+const livesSpan = document.getElementById('livesDisplay');
+const stageSpan = document.getElementById('stageDisplay');
+const overlay = document.getElementById('overlay');
+
+// ─── Audio (Web Audio blips) ─────────────────────────────────
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+function initAudio() { if (!audioCtx) audioCtx = new AudioCtx(); }
+
+function playBlip(freq, duration, type = 'square', vol = 0.08) {
+  try {
+    initAudio();
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.value = vol;
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + duration);
+  } catch(e) {}
+}
+
+function sfxShoot()    { playBlip(880, 0.08); }
+function sfxHit()      { playBlip(220, 0.2, 'sawtooth', 0.12); }
+function sfxExplode()  { playBlip(80, 0.4, 'sawtooth', 0.15); }
+function sfxFormation(){ playBlip(440, 0.1); }
+function sfxDive()     { playBlip(660, 0.15, 'square', 0.06); }
+
+// ─── Game State ──────────────────────────────────────────────
+const KEY = { LEFT: false, RIGHT: false, SPACE: false };
+let gameState = 'title'; // title | playing | gameover
+let score = 0;
+let lives = 3;
+let stage = 1;
+let levelEnemySpeed = 1;
+
+// ─── Player ──────────────────────────────────────────────────
+const player = {
+  x: W/2, y: H - 50,
+  w: 24, h: 24,
+  speed: 4,
+  alive: true,
+  respawnTimer: 0,
+  bullets: [],
+  cooldown: 0,
+  dual: false,  // dual-fighter mode (rescued ship)
+  fireRate: 8,
+  invincible: 0
+};
+
+// ─── Enemies ─────────────────────────────────────────────────
+const ENEMY_TYPES = {
+  BEE:    { w:20, h:20, points: 100, color: '#f84', hp: 1 },
+  SCORPION: { w:22, h:22, points: 200, color: '#4af', hp: 2 },
+  BUTTERFLY: { w:20, h:20, points: 150, color: '#f4f', hp: 1 },
+  BOSS:   { w:28, h:28, points: 500, color: '#f22', hp: 4 }
+};
+
+let enemies = [];
+let enemyBullets = [];
+let particles = [];
+let stars = [];
+let formationDrift = 0;
+let formationDriftDir = 1;
+let diveQueue = [];
+let diveTimer = 0;
+let allEnemiesDead = false;
+let stageClearTimer = 0;
+
+// ─── Stars Background ────────────────────────────────────────
+for (let i = 0; i < 80; i++) {
+  stars.push({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    size: Math.random() * 2 + 0.5,
+    speed: Math.random() * 0.5 + 0.1
+  });
+}
+
+// ─── Formations ──────────────────────────────────────────────
+function createFormation() {
+  enemies = [];
+  enemyBullets = [];
+  diveQueue = [];
+  allEnemiesDead = false;
+  stageClearTimer = 0;
+  player.dual = false;
+  levelEnemySpeed = 1 + (stage - 1) * 0.15;
+  if (levelEnemySpeed > 3) levelEnemySpeed = 3;
+
+  // Galaga has ~40 enemies in 4 rows x 10 columns
+  // Rows from top: BOSS, BEE, BUTTERFLY, SCORPION
+  const rows = [
+    { type: 'BOSS', count: 2, yOff: 0 },
+    { type: 'BEE', count: 10, yOff: 32 },
+    { type: 'BUTTERFLY', count: 10, yOff: 58 },
+    { type: 'SCORPION', count: 10, yOff: 84 }
+  ];
+
+  // Boss row just 2 in middle
+  for (let i = 0; i < 2; i++) {
+    const x = W/2 - 14 + i * 32;
+    enemies.push(makeEnemy(x, 40 + rows[0].yOff, 'BOSS', i, 0));
+  }
+
+  // Standard rows: 10 enemies each
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const total = row.count;
+    const spacing = 40;
+    const startX = (W - (total - 1) * spacing) / 2;
+    for (let i = 0; i < total; i++) {
+      const x = startX + i * spacing;
+      enemies.push(makeEnemy(x, 40 + row.yOff, row.type, i, r));
+    }
+  }
+
+  // Initial dive-bomber queue
+  queueDiveBombers();
+}
+
+function makeEnemy(x, y, type, col, row) {
+  const t = ENEMY_TYPES[type];
+  return {
+    x, y,
+    startX: x, startY: y,
+    w: t.w, h: t.h,
+    type: type,
+    points: t.points,
+    color: t.color,
+    hp: t.hp,
+    maxHp: t.hp,
+    alive: true,
+    col, row,
+    diving: false,
+    diveTargetX: 0,
+    diveTargetY: 0,
+    diveSpeed: 1.5 * levelEnemySpeed,
+    sinOffset: Math.random() * Math.PI * 2,
+    captured: null  // player index if captured
+  };
+}
+
+function queueDiveBombers() {
+  diveQueue = [];
+  const alive = enemies.filter(e => e.alive && !e.diving);
+  // Pick 2-4 random enemies to dive
+  const count = Math.min(2 + Math.floor(stage / 2), 6);
+  const shuffled = [...alive].sort(() => Math.random() - 0.5);
+  for (let i = 0; i < Math.min(count, shuffled.length); i++) {
+    diveQueue.push(shuffled[i]);
+  }
+}
+
+// ─── Input ───────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft')  KEY.LEFT = true;
+  if (e.key === 'ArrowRight') KEY.RIGHT = true;
+  if (e.key === ' ') { KEY.SPACE = true; e.preventDefault(); }
+  if (e.key === ' ' && gameState === 'title') { startGame(); e.preventDefault(); }
+  if (e.key === ' ' && gameState === 'gameover') { resetGame(); e.preventDefault(); }
+});
+
+document.addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft')  KEY.LEFT = false;
+  if (e.key === 'ArrowRight') KEY.RIGHT = false;
+  if (e.key === ' ') KEY.SPACE = false;
+});
+
+overlay.addEventListener('click', () => {
+  if (gameState === 'title') startGame();
+  if (gameState === 'gameover') resetGame();
+});
+
+// ─── Game Flow ───────────────────────────────────────────────
+function startGame() {
+  initAudio();
+  score = 0; lives = 3; stage = 1;
+  gameState = 'playing';
+  overlay.style.display = 'none';
+  player.alive = true;
+  player.x = W/2;
+  player.dual = false;
+  player.invincible = 0;
+  createFormation();
+}
+
+function resetGame() {
+  score = 0; lives = 3; stage = 1;
+  startGame();
+}
+
+function gameOver() {
+  gameState = 'gameover';
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `
+    <h1>GAME OVER</h1>
+    <h2>SCORE: ${score}</h2>
+    <p class="blink">PRESS SPACE TO RESTART</p>
+  `;
+}
+
+function nextStage() {
+  stage++;
+  player.alive = true;
+  player.x = W/2;
+  player.dual = false;
+  player.invincible = 90;
+  player.bullets = [];
+  createFormation();
+  sfxFormation();
+}
+
+// ─── Update ──────────────────────────────────────────────────
+function update() {
+  if (gameState !== 'playing') return;
+
+  // Player movement
+  if (player.alive) {
+    if (KEY.LEFT)  player.x -= player.speed;
+    if (KEY.RIGHT) player.x += player.speed;
+    player.x = Math.max(20, Math.min(W - 20, player.x));
+
+    if (player.cooldown > 0) player.cooldown--;
+    if (KEY.SPACE && player.cooldown === 0) {
+      player.bullets.push({ x: player.x, y: player.y - 12, w: 3, h: 10 });
+      if (player.dual) {
+        player.bullets.push({ x: player.x - 10, y: player.y - 8, w: 3, h: 8 });
+        player.bullets.push({ x: player.x + 10, y: player.y - 8, w: 3, h: 8 });
+      }
+      player.cooldown = player.fireRate;
+      sfxShoot();
+    }
+
+    if (player.invincible > 0) player.invincible--;
+  } else {
+    player.respawnTimer--;
+    if (player.respawnTimer <= 0 && lives > 0) {
+      // Check if it's safe to respawn (no enemies near bottom)
+      let safe = true;
+      for (const e of enemies) {
+        if (e.alive && e.diving && e.y > H - 100) { safe = false; break; }
+      }
+      if (safe) {
+        player.alive = true;
+        player.x = W/2;
+        player.invincible = 90;
+        player.bullets = [];
+      }
+    }
+    if (lives <= 0) { gameOver(); return; }
+  }
+
+  // Player bullets
+  for (let i = player.bullets.length - 1; i >= 0; i--) {
+    const b = player.bullets[i];
+    b.y -= 6;
+    if (b.y < -10) { player.bullets.splice(i, 1); continue; }
+
+    // Hit check
+    let hit = false;
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (b.x > e.x - e.w/2 && b.x < e.x + e.w/2 &&
+          b.y > e.y - e.h/2 && b.y < e.y + e.h/2) {
+        e.hp--;
+        hit = true;
+        if (e.hp <= 0) {
+          e.alive = false;
+          score += e.points;
+          // Explosion particles
+          spawnExplosion(e.x, e.y, e.color);
+          sfxHit();
+          // If was carrying captured player
+          if (e.captured !== undefined) {
+            player.dual = true;
+            // Rescue flash
+            for (let p = 0; p < 20; p++) {
+              particles.push({
+                x: e.x, y: e.y,
+                vx: (Math.random()-0.5)*4, vy: (Math.random()-0.5)*4 - 2,
+                life: 40, maxLife: 40,
+                color: '#ff0', size: 3
+              });
+            }
+          }
+          // Check all dead
+          if (enemies.every(en => !en.alive)) {
+            allEnemiesDead = true;
+            stageClearTimer = 120;
+            sfxFormation();
+          }
+        } else {
+          spawnExplosion(e.x, e.y, '#fff');
+        }
+        player.bullets.splice(i, 1);
+        break;
+      }
+    }
+    if (hit) continue;
+  }
+
+  // Formation drift
+  formationDrift += 0.3 * formationDriftDir * levelEnemySpeed;
+  if (Math.abs(formationDrift) > 20) formationDriftDir *= -1;
+
+  // Enemy formation update
+  let anyDiving = false;
+  for (const e of enemies) {
+    if (!e.alive) continue;
+
+    if (e.diving) {
+      anyDiving = true;
+      // Dive toward target with sin wave
+      const dx = e.diveTargetX - e.x;
+      const dy = e.diveTargetY - e.y;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist > 5) {
+        const spd = e.diveSpeed;
+        e.x += (dx/dist) * spd;
+        e.y += (dy/dist) * spd;
+        // Sin oscillation
+        e.x += Math.sin(Date.now() / 200 + e.sinOffset) * 1.5;
+      } else {
+        // Reached target - turn around or attack further
+        e.diveTargetY = H + 60;
+        e.diveTargetX = W/2 + (Math.random()-0.5) * W * 0.6;
+      }
+
+      // Shoot while diving
+      if (Math.random() < 0.015 * levelEnemySpeed) {
+        enemyBullets.push({
+          x: e.x, y: e.y + e.h/2,
+          w: 4, h: 4
+        });
+      }
+
+      // If off screen bottom, return to formation
+      if (e.y > H + 40) {
+        e.diving = false;
+        e.x = e.startX + formationDrift;
+        e.y = e.startY;
+      }
+
+      // Check collision with player
+      if (player.alive && player.invincible <= 0) {
+        if (Math.abs(e.x - player.x) < 20 && Math.abs(e.y - player.y) < 20) {
+          killPlayer();
+          e.diving = false;
+          e.x = e.startX + formationDrift;
+          e.y = e.startY;
+        }
+      }
+
+      // Capture player
+      if (e.captured === undefined && !player.dual && player.alive && player.invincible <= 0) {
+        // Enemy can capture player on pass
+      }
+    } else {
+      // In formation
+      e.x = e.startX + formationDrift;
+      e.y = e.startY;
+    }
+  }
+
+  // Queue dive bombers
+  if (!anyDiving) {
+    diveTimer--;
+    if (diveTimer <= 0 && diveQueue.length > 0) {
+      const diver = diveQueue.shift();
+      if (diver && diver.alive) {
+        diver.diving = true;
+        diver.diveTargetX = player.x + (Math.random() - 0.5) * 80;
+        diver.diveTargetY = H - 80;
+        diver.diveSpeed = 1.5 * levelEnemySpeed;
+        sfxDive();
+        diveTimer = 30 + Math.floor(Math.random() * 40);
+      } else {
+        // Replenish queue
+        queueDiveBombers();
+      }
+    }
+    if (diveQueue.length === 0 && !anyDiving) {
+      queueDiveBombers();
+      diveTimer = 60;
+    }
+  }
+
+  // Enemy bullets
+  for (let i = enemyBullets.length - 1; i >= 0; i--) {
+    const b = enemyBullets[i];
+    b.y += 3;
+    if (b.y > H + 10) { enemyBullets.splice(i, 1); continue; }
+    if (player.alive && player.invincible <= 0) {
+      if (Math.abs(b.x - player.x) < 12 && Math.abs(b.y - player.y) < 12) {
+        killPlayer();
+        enemyBullets.splice(i, 1);
+      }
+    }
+  }
+
+  // Stage clear
+  if (allEnemiesDead) {
+    stageClearTimer--;
+    if (stageClearTimer <= 0) {
+      nextStage();
+    }
+  }
+
+  // Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Stars
+  for (const s of stars) {
+    s.y += s.speed;
+    if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+  }
+
+  // UI
+  scoreSpan.textContent = score;
+  livesSpan.textContent = lives;
+  stageSpan.textContent = stage;
+}
+
+function killPlayer() {
+  player.alive = false;
+  player.respawnTimer = 120;
+  lives--;
+  spawnExplosion(player.x, player.y, '#ff0');
+  sfxExplode();
+  player.bullets = [];
+}
+
+function spawnExplosion(x, y, color) {
+  for (let i = 0; i < 15; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd = Math.random() * 3 + 1;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * spd,
+      vy: Math.sin(angle) * spd,
+      life: 30 + Math.random() * 20,
+      maxLife: 50,
+      color: Math.random() > 0.5 ? '#fff' : color,
+      size: 2 + Math.random() * 3
+    });
+  }
+}
+
+// ─── Draw ────────────────────────────────────────────────────
+function draw() {
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  for (const s of stars) {
+    ctx.fillStyle = `rgba(255,255,255,${0.3 + s.size * 0.3})`;
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  }
+
+  // Particles
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // Player bullets
+  for (const b of player.bullets) {
+    ctx.fillStyle = '#0ff';
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = '#0ff';
+    ctx.fillRect(b.x - b.w/2, b.y - b.h/2, b.w, b.h);
+  }
+  ctx.shadowBlur = 0;
+
+  // Enemy bullets
+  for (const b of enemyBullets) {
+    ctx.fillStyle = '#f44';
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = '#f44';
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.w/2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+
+  // Enemies
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    ctx.save();
+
+    // Flash when hit
+    if (e.hp < e.maxHp) {
+      ctx.globalAlpha = 0.5 + Math.sin(Date.now() / 50) * 0.3;
+    }
+
+    const x = e.x, y = e.y, w = e.w, h = e.h;
+
+    // Body
+    ctx.fillStyle = e.color;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = e.color;
+
+    // Draw enemy shape based on type
+    ctx.beginPath();
+    if (e.type === 'BOSS') {
+      // Boss: bigger, with wings
+      ctx.moveTo(x, y - h/2);
+      ctx.lineTo(x + w/2, y - h/4);
+      ctx.lineTo(x + w/2 + 6, y);
+      ctx.lineTo(x + w/2, y + h/4);
+      ctx.lineTo(x, y + h/2);
+      ctx.lineTo(x - w/2, y + h/4);
+      ctx.lineTo(x - w/2 - 6, y);
+      ctx.lineTo(x - w/2, y - h/4);
+      ctx.closePath();
+    } else if (e.type === 'BEE') {
+      // Bee: angular
+      ctx.moveTo(x, y - h/2);
+      ctx.lineTo(x + w/2, y - h/4);
+      ctx.lineTo(x + w/2 + 4, y);
+      ctx.lineTo(x + w/2, y + h/4);
+      ctx.lineTo(x, y + h/2);
+      ctx.lineTo(x - w/2, y + h/4);
+      ctx.lineTo(x - w/2 - 4, y);
+      ctx.lineTo(x - w/2, y - h/4);
+      ctx.closePath();
+    } else if (e.type === 'BUTTERFLY') {
+      // Butterfly: round wings
+      ctx.ellipse(x, y, w/2 + 4, h/2, 0, 0, Math.PI * 2);
+    } else {
+      // Scorpion
+      ctx.moveTo(x, y - h/2);
+      ctx.lineTo(x + w/2 + 2, y);
+      ctx.lineTo(x, y + h/2);
+      ctx.lineTo(x - w/2 - 2, y);
+      ctx.closePath();
+    }
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Capture beam / status indicator
+    if (e.captured !== undefined) {
+      ctx.strokeStyle = '#ff0';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(e.x, e.y);
+      ctx.lineTo(e.x, e.y + 20);
+      ctx.stroke();
+    }
+
+    // HP bar for multi-hit
+    if (e.maxHp > 1) {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(x - 10, y - h/2 - 6, 20, 4);
+      ctx.fillStyle = '#0f0';
+      ctx.fillRect(x - 10, y - h/2 - 6, 20 * (e.hp / e.maxHp), 4);
+    }
+
+    ctx.restore();
+  }
+
+  // Player ship
+  if (player.alive && (player.invincible <= 0 || Math.floor(Date.now() / 80) % 2 === 0)) {
+    ctx.save();
+    const px = player.x, py = player.y;
+
+    // Glow
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#0ff';
+
+    // Main ship body
+    ctx.fillStyle = '#0cf';
+    ctx.beginPath();
+    ctx.moveTo(px, py - 14);
+    ctx.lineTo(px + 12, py + 4);
+    ctx.lineTo(px + 8, py + 10);
+    ctx.lineTo(px, py + 6);
+    ctx.lineTo(px - 8, py + 10);
+    ctx.lineTo(px - 12, py + 4);
+    ctx.closePath();
+    ctx.fill();
+
+    // Cockpit
+    ctx.fillStyle = '#0ff';
+    ctx.beginPath();
+    ctx.arc(px, py - 4, 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Engine glow
+    ctx.fillStyle = '#f80';
+    ctx.shadowColor = '#f80';
+    ctx.beginPath();
+    ctx.moveTo(px - 6, py + 8);
+    ctx.lineTo(px, py + 16);
+    ctx.lineTo(px + 6, py + 8);
+    ctx.fill();
+
+    // Dual fighter (wingman indicator)
+    if (player.dual) {
+      ctx.fillStyle = '#0f0';
+      ctx.shadowColor = '#0f0';
+      ctx.beginPath();
+      ctx.moveTo(px - 20, py - 4);
+      ctx.lineTo(px - 18, py + 4);
+      ctx.lineTo(px - 22, py + 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(px + 20, py - 4);
+      ctx.lineTo(px + 18, py + 4);
+      ctx.lineTo(px + 22, py + 4);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  // Stage clear text
+  if (allEnemiesDead && stageClearTimer > 0) {
+    ctx.save();
+    ctx.fillStyle = '#ff0';
+    ctx.font = '24px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#ff0';
+    ctx.fillText('STAGE CLEAR!', W/2, H/2 - 20);
+    ctx.restore();
+  }
+}
+
+// ─── Game Loop ───────────────────────────────────────────────
+function gameLoop() {
+  update();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+
+// Allow start from overlay
+overlay.style.display = 'flex';
+</script>
+</body>
+</html>
